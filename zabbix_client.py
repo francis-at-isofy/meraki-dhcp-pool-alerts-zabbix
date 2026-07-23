@@ -19,62 +19,101 @@ def _make_api(api_url: str, api_token: str):
 
 def send_alerts(
     alerts: list[dict],
-    all_network_names: list[str],
+    all_isofy_ids: list[str],
     api_url: str,
     api_token: str,
 ) -> bool:
     """
-    Send DHCP pool alerts to the correct Zabbix hosts via history.push API.
+    Send DHCP pool alerts to the correct Zabbix hosts via history.push.
 
-    Each alert targets host "{network_name}-Firewall" — matching the existing
-    Zabbix host naming convention.
+    Routing: each site's isofy_id (from the Meraki network's `notes` field)
+    matches a Zabbix hostgroup of the same name (e.g. "CA-D-30-Adelaide-St").
+    The firewall host inside that group is the one whose name contains
+    "Firewall" (e.g. "IND-Toronto-30Adelaide-Firewall").
 
-    Multiple VLANs alerting on the same host are grouped into one message so
-    the alert text always shows all affected VLANs, e.g.:
+    Multiple VLANs alerting on the same site are grouped into one message:
       "VLAN 10 (10.0.1.0/24): 95.0% | VLAN 20 (192.168.20.0/24): 91.5%"
 
     Items pushed:
       - meraki.dhcp.pool.alert  (text):    combined VLAN alert message
       - meraki.dhcp.pool.status (numeric): 1 if alerting, 0 if clear
 
-    Networks with no alerts receive status=0 to clear any previous trigger.
+    Sites with no alerts receive status=0 to clear any previous trigger.
     """
+    if not all_isofy_ids:
+        logger.info("No isofy_ids to route — nothing to send.")
+        return True
+
     api = _make_api(api_url, api_token)
 
-    # Batch-fetch item IDs for all relevant hosts in one API call
-    hosts_needed = [f"{n}-Firewall" for n in all_network_names]
+    try:
+        groups = api.hostgroup.get(
+            filter={"name": all_isofy_ids},
+            selectHosts=["hostid", "host"],
+            output=["groupid", "name"],
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch hostgroups from Zabbix API: {e}")
+        return False
+
+    isofy_to_firewall: dict[str, dict] = {}
+    found_names = {g["name"] for g in groups}
+    for missing in set(all_isofy_ids) - found_names:
+        logger.warning(f"  No Zabbix hostgroup found for isofy_id '{missing}'")
+
+    for group in groups:
+        isofy_id = group["name"]
+        firewalls = [h for h in group.get("hosts", []) if "firewall" in h["host"].lower()]
+        if not firewalls:
+            logger.warning(
+                f"  Hostgroup '{isofy_id}' has no host containing 'Firewall' — skipping"
+            )
+            continue
+        if len(firewalls) > 1:
+            names = ", ".join(h["host"] for h in firewalls)
+            logger.warning(
+                f"  Hostgroup '{isofy_id}' has multiple Firewall hosts ({names}) — "
+                f"using '{firewalls[0]['host']}'"
+            )
+        isofy_to_firewall[isofy_id] = firewalls[0]
+
+    if not isofy_to_firewall:
+        logger.warning("No Zabbix firewall hosts resolved — nothing to send.")
+        return True
+
+    firewall_hostids = [h["hostid"] for h in isofy_to_firewall.values()]
     try:
         items = api.item.get(
+            hostids=firewall_hostids,
             filter={"key_": [ALERT_ITEM_KEY, STATUS_ITEM_KEY]},
-            host=hosts_needed,
-            output=["itemid", "key_"],
-            selectHosts=["host"],
+            output=["itemid", "key_", "hostid"],
         )
     except Exception as e:
         logger.error(f"Failed to fetch item IDs from Zabbix API: {e}")
         return False
 
-    # Build lookup: (host_name, item_key) -> itemid
-    item_id_map: dict[tuple[str, str], str] = {}
-    for item in items:
-        host_name = item["hosts"][0]["host"]
-        item_id_map[(host_name, item["key_"])] = item["itemid"]
+    item_id_map: dict[tuple[str, str], str] = {
+        (item["hostid"], item["key_"]): item["itemid"] for item in items
+    }
 
-    # Group alerts by network so multiple VLANs are combined into one message
-    by_network: dict[str, list[dict]] = defaultdict(list)
+    by_isofy: dict[str, list[dict]] = defaultdict(list)
     for alert in alerts:
-        by_network[alert["network_name"]].append(alert)
+        by_isofy[alert["isofy_id"]].append(alert)
 
     payload = []
 
-    for network_name, network_alerts in by_network.items():
-        zabbix_host = f"{network_name}-Firewall"
-        alert_id = item_id_map.get((zabbix_host, ALERT_ITEM_KEY))
-        status_id = item_id_map.get((zabbix_host, STATUS_ITEM_KEY))
+    for isofy_id, site_alerts in by_isofy.items():
+        firewall = isofy_to_firewall.get(isofy_id)
+        if not firewall:
+            continue
+        hostid = firewall["hostid"]
+        zabbix_host = firewall["host"]
+        alert_id = item_id_map.get((hostid, ALERT_ITEM_KEY))
+        status_id = item_id_map.get((hostid, STATUS_ITEM_KEY))
 
         if not alert_id or not status_id:
             logger.warning(
-                f"  Skipping {zabbix_host} — items not found in Zabbix "
+                f"  Skipping {zabbix_host} (isofy_id '{isofy_id}') — items not found "
                 f"(alert_id={alert_id}, status_id={status_id})"
             )
             continue
@@ -82,20 +121,19 @@ def send_alerts(
         msg = " | ".join(
             f"VLAN {a['vlan_id']} ({a['subnet']}): {a['usage_pct']:.1f}% "
             f"({a['used']}/{a['total']} addresses)"
-            for a in sorted(network_alerts, key=lambda a: a["vlan_id"] or 0)
+            for a in sorted(site_alerts, key=lambda a: a["vlan_id"] or 0)
         )
 
         payload.append({"itemid": alert_id, "value": msg})
         payload.append({"itemid": status_id, "value": "1"})
-        logger.warning(f"  ALERT -> {zabbix_host}: {msg}")
+        logger.warning(f"  ALERT -> {zabbix_host} [{isofy_id}]: {msg}")
 
-    # Send status=0 to networks that are now clear (resolves previous triggers)
-    for network_name in all_network_names:
-        if network_name not in by_network:
-            zabbix_host = f"{network_name}-Firewall"
-            status_id = item_id_map.get((zabbix_host, STATUS_ITEM_KEY))
-            if status_id:
-                payload.append({"itemid": status_id, "value": "0"})
+    for isofy_id, firewall in isofy_to_firewall.items():
+        if isofy_id in by_isofy:
+            continue
+        status_id = item_id_map.get((firewall["hostid"], STATUS_ITEM_KEY))
+        if status_id:
+            payload.append({"itemid": status_id, "value": "0"})
 
     if not payload:
         logger.info("No Zabbix values to send.")
@@ -110,7 +148,6 @@ def send_alerts(
             else:
                 logger.error(f"Zabbix history.push rejected: {response.get('data', 'unknown')}")
             return success
-        # List-of-dicts format (future versions)
         failed = sum(1 for r in response if isinstance(r, dict) and r.get("error"))
         logger.info(f"Zabbix history.push: processed={len(payload) - failed}, failed={failed}")
         return failed == 0

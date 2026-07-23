@@ -49,24 +49,24 @@ def run_scan(config: dict):
 
     threshold = config["alert_threshold"]
     alerts = [p for p in pools if p["usage_pct"] > threshold]
-    all_network_names = list({p["network_name"] for p in pools})
+    all_isofy_ids = list({p["isofy_id"] for p in pools if p.get("isofy_id")})
 
     logger.info(
-        f"Scan complete: {len(pools)} pools across {len(all_network_names)} networks, "
+        f"Scan complete: {len(pools)} pools across {len(all_isofy_ids)} sites, "
         f"{len(alerts)} over {threshold:.0f}% threshold."
     )
 
     if alerts:
         for a in alerts:
             logger.warning(
-                f"  [{a['network_name']}] VLAN {a['vlan_id']} "
+                f"  [{a['network_name']} / {a['isofy_id']}] VLAN {a['vlan_id']} "
                 f"({a['subnet']}): {a['usage_pct']:.1f}% "
                 f"({a['used']}/{a['total']} addresses used)"
             )
 
     send_alerts(
         alerts=alerts,
-        all_network_names=all_network_names,
+        all_isofy_ids=all_isofy_ids,
         api_url=config["zabbix_api_url"],
         api_token=config["zabbix_api_token"],
     )
