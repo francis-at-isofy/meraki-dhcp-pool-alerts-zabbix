@@ -29,7 +29,7 @@ Monitors Cisco Meraki DHCP pool usage across all networks and sends alerts to Za
 
 ```bash
 # 1. Clone / copy the project
-git clone <repo-url> /opt/meraki-dhcp-alerts
+git clone https://github.com/francis-at-isofy/meraki-dhcp-pool-alerts-zabbix.git /opt/meraki-dhcp-alerts
 cd /opt/meraki-dhcp-alerts
 
 # 2. Create a virtual environment and install dependencies
